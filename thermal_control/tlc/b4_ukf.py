@@ -109,7 +109,9 @@ class B4UKF:
             zz = np.empty_like(dl)
             for mv in np.unique(mods[il]):
                 c = np.where(mods[il] == mv)[0]
-                q1, q2 = lockin_ratios(dl[:, c], m["a_nom"][il][c][None, :], self.hwhm[il][c][None, :], mv)
+                shp = m.get("shape")
+                q1, q2 = lockin_ratios(dl[:, c], m["a_nom"][il][c][None, :], self.hwhm[il][c][None, :], mv,
+                                       None if shp is None else shp[il][c])
                 zz[:, c] = q2 / q1
             cols.append(zz)
         if len(idc):

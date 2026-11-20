@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# raw simulation traces (large; regenerate with scenarios.py)
+thermal_control/results/*.npz

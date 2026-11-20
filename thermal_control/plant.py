@@ -34,9 +34,9 @@ class Plant:
         self.cmat = coupling_matrix(p.coupling) * p.coupling_scale
         r_self = p.r_hf + p.r_hs
         # first-order paths: (time constant, state index)
-        self.taus = np.array([p.tau_hf, p.tau_hs, p.tau_x, p.tau_shf, p.tau_shs, p.tau_e])
+        self.taus = np.array([p.tau_hf, p.tau_hs, p.tau_x, p.tau_shf, p.tau_shs, p.tau_e, p.tau_hm, p.tau_hd])
         self.r_self = r_self
-        self.state = np.zeros((6, N_RINGS))   # K
+        self.state = np.zeros((8, N_RINGS))   # K
         self.t = 0.0
         self.sigma_ones = 0.5 / np.sqrt(p.sym_rate * self.dt)
         # channel offsets of every laser relative to ring i's own laser (GHz, wavelength direction)
@@ -49,15 +49,21 @@ class Plant:
         """Put the thermal states at steady state for constant command u (used for warm starts)."""
         p = self.p
         for _ in range(n_iter):
-            ph = u * p.p_heater_max * self.eff
+            ph = self._power(u)
             delta = self._delta(self.state.sum(0), dist_sample["dT"][0], dist_sample["laser"][0])
             pabs = self._absorbed(delta, dist_sample["pscale"][0], dist_sample["squelch"][0])
             tgt = self._targets(ph, pabs, dist_sample["squelch"][0])
             self.state = tgt
         self.last_delta = self._delta(self.state.sum(0), dist_sample["dT"][0], dist_sample["laser"][0])
 
+    def _power(self, u):
+        """Heater power (W) for command u: linear by default, bowed when heater_curve != 0."""
+        p = self.p
+        return p.p_heater_max * self.eff * (u + p.heater_curve * u * (1.0 - u))
+
     def _delta(self, temp, dT, laser):
-        return self.unheated + self.p.kappa * (temp + dT) - laser
+        kap = self.p.kappa * (1.0 + self.p.kappa_tc * temp)
+        return self.unheated + kap * (temp + dT) - laser
 
     def _lineshape_sum(self, delta, frac_ones, squelch):
         """sum_j P_j * L_avg(delta_i - off_ij); delta (..., 4) -> (..., 4, 4) summed over j"""
@@ -83,6 +89,8 @@ class Plant:
             pabs * p.r_shf,
             pabs * p.r_shs,
             e_in,
+            heat_self * p.r_hm,
+            heat_self * p.r_hd,
         ])
 
     # ------------------------------------------------------------------------------------
@@ -102,7 +110,7 @@ class Plant:
         temps = np.empty((n, N_RINGS))
         for s in range(n_sub):
             sl = slice(s * k, (s + 1) * k)
-            ph = np.clip(u_seq[s], 0.0, 1.0) * p.p_heater_max * self.eff
+            ph = self._power(np.clip(u_seq[s], 0.0, 1.0))
             j0 = s * k
             jm = j0 + k // 2
             # semi-implicit self heating: evaluate absorption at the mid-substep detuning predicted
@@ -110,7 +118,7 @@ class Plant:
             tgt0 = self._targets(ph, np.zeros(N_RINGS), dist["squelch"][j0])
             mid = k // 2
             other = tgt0 + (self.state - tgt0) * decay[:, mid - 1][:, None]
-            temp_mid = other[[0, 1, 2, 5]].sum(0) + self.state[3] + self.state[4]
+            temp_mid = other[[0, 1, 2, 5, 6, 7]].sum(0) + self.state[3] + self.state[4]
             d_mid = self._delta(temp_mid, dist["dT"][jm], dist["laser"][jm])
             pabs = self._absorbed(d_mid, dist["pscale"][j0], dist["squelch"][j0])
             tgt = self._targets(ph, pabs, dist["squelch"][j0])
@@ -119,15 +127,23 @@ class Plant:
             self.state = traj[:, -1, :]
             temps[sl] = traj.sum(0)
             self.last_delta = self._delta(temps[sl][-1], dist["dT"][j0 + k - 1], dist["laser"][j0 + k - 1])
-        delta = self.unheated + p.kappa * (temps + dist["dT"]) - dist["laser"]      # (n, 4)
+        delta = self._delta(temps, dist["dT"], dist["laser"])      # (n, 4)
 
         # monitor photodiodes
         frac = 0.5 + self.sigma_ones * self.rng.standard_normal((n, N_RINGS))
         ls = self._lineshape_sum(delta, frac, dist["squelch"])                    # (n, 4, 4)
         pw = self.p_laser[None, :] * dist["pscale"]                                 # (n, 4) per laser j
+        if p.rin_dbc_hz > -150.0:
+            rin = 10 ** (p.rin_dbc_hz / 20) * np.sqrt(p.pd_rate / 2)
+            pw = pw * (1.0 + rin * self.rng.standard_normal((n, N_RINGS)))
         drop_mw = (ls * pw[:, None, :]).sum(-1) * self.depth
-        pd = drop_mw / p.pd_full_scale_mw + p.pd_noise_fs * self.rng.standard_normal((n, N_RINGS))
+        sig = drop_mw / p.pd_full_scale_mw
+        sigma = p.noise_sigma_fs(sig)               # excess + Johnson + signal-dependent shot
+        off = np.array(p.pd_offset_fs) + np.array(p.pd_offset_drift_fs_per_s) * self.t
+        pd = sig + sigma * self.rng.standard_normal((n, N_RINGS)) + off
         lsb = 1.0 / 2 ** p.pd_bits
+        if p.adc_inl_lsb:
+            pd = pd + p.adc_inl_lsb * lsb * np.sin(2 * np.pi * 3.0 * pd + np.arange(N_RINGS))
         pd = np.clip(np.round(pd / lsb) * lsb, 0.0, 1.0 - lsb)
         f = dist["pdfault"]
         if f.any():
@@ -135,5 +151,5 @@ class Plant:
             pd = np.where(f == 2, 0.31, pd)
             pd = np.where(f == 3, 1.0 - lsb, pd)
         self.t += n * self.dt
-        heater_w = np.clip(u_seq, 0, 1).mean(0) * p.p_heater_max * self.eff
+        heater_w = self._power(np.clip(u_seq, 0, 1)).mean(0)
         return pd, {"delta_end": delta[-1], "delta_mean": delta.mean(0), "heater_w": heater_w}

@@ -34,7 +34,7 @@ class B3LockIn:
         # Hann window: suppresses leakage of slow detuning trends into the tone bins
         n = x.shape[0]
         if getattr(self, "_win", None) is None or len(self._win) != n:
-            self._win = np.hanning(n + 2)[1:-1]
+            self._win = np.ones(n) if getattr(self, "rect", False) else np.hanning(n + 2)[1:-1]
             self._win /= self._win.sum()
         xw = x * self._win[:, None]
         y0 = xw.sum(0)

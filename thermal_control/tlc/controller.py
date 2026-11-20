@@ -3,9 +3,9 @@ from collections import deque
 
 import numpy as np
 
-from optics import lockin_ratios
+from optics import lockin_ratios, THETA
 from params import ControllerParams, PlantParams
-from .b1_dither import B1Dither
+from .b1_dither import K_HARM, B1Dither
 from .b2_conditioner import B2Conditioner
 from .b3_lockin import B3LockIn
 from .b4_thermal_model import ThermalModel
@@ -20,11 +20,14 @@ from .b10_calibration import B10Calibration
 from .common import Mode, N
 
 
+
+
 class TLC(SupervisorMixin):
     """Thermal locking controller: call step() once per 100 us block of PD samples."""
 
-    def __init__(self, pp: PlantParams, cp: ControllerParams, use_mpc=True, learn=True):
+    def __init__(self, pp: PlantParams, cp: ControllerParams, use_mpc=True, learn=True, ablate=()):
         self.pp, self.cp = pp, cp
+        self.ablate = frozenset(ablate)     # A/B switches: names listed in tlc.ABLATIONS
         self.cal = B10Calibration(pp, cp)
         self.sp = B6Setpoints(self.cal, cp)
         self.dither = B1Dither(cp)
@@ -32,6 +35,7 @@ class TLC(SupervisorMixin):
         self.out = B8Output(cp)
         self.out_delay = 0.5 / cp.out_rate            # ZOH of the dither samples
         self.lockin = B3LockIn(cp, self.out_delay, pp.pd_rate / cp.decim)
+        self.lockin.rect = "no_hann" in self.ablate
         self.ukf = B4UKF(cp, self.cal.hwhm, self.cal.mod,
                          self.cal.p_laser * self.cal.depth / pp.pd_full_scale_mw)
         self.theta_obs = np.ones(N)
@@ -57,6 +61,8 @@ class TLC(SupervisorMixin):
         self.sq_count = np.zeros(N)
         self.acq = [dict() for _ in range(N)]
         self.hold_from = np.full(N, Mode.TRACK)
+        self.phcal = np.zeros(N)       # accumulated online phase correction of each own tone (rad)
+        self.shape = None
         self._refresh_model()
         # acquisition lookup: z1 / max(z1) on the approach -> detuning on the long side
         self._build_acq_tables()
@@ -69,29 +75,75 @@ class TLC(SupervisorMixin):
     # ------------------------------------------------------------------------------
     def _refresh_model(self):
         gf, ghs, gx = self.cal.gains(self.sp.targets)
+        if "no_xtalk" in self.ablate:
+            gx = np.zeros_like(gx)
         self.model.set_gains(gf, ghs, gx)
         self.mpc.build(self.model)
         H = self.cal.dither_response(self.sp.targets, self.cp.tone_freqs, self.out_delay)
+        own = np.arange(N)
+        if self.dither.square:
+            H[own, own] *= np.exp(1j * self.dither.phi1)       # ramp delay of the actual wave
         if hasattr(self, "H") and np.any(np.abs(getattr(self, "iq_avg", np.zeros(N))) > 0.5):
             own = np.arange(N)
             H[own, own] = np.abs(H[own, own]) * np.exp(1j * np.angle(self.H[own, own]))
         self.H = H
         self.h_own_abs = np.abs(np.diag(self.H))
+        tones = np.array(self.cp.tone_freqs)
+        ks = K_HARM if self.dither.square else (1,)
+        self._Hk0 = [None if k == 1 else self.cal.dither_response(self.sp.targets, tones * k, self.out_delay)
+                     for k in ks]
+        if self.dither.square:
+            for k, Hk0 in zip(ks, self._Hk0):
+                if Hk0 is not None:
+                    Hk0[own, own] *= np.exp(1j * k * self.dither.phi1)
+        self._update_wave()
         self.pi.g = self.cal.dc_gain_open() * np.real(self.cal.self_heating_factor(self.sp.targets))
         # slope of z1 at target per GHz (for the PI error signal)
         a = self.cp.dither_nominal
         d = 0.05
-        z_hi, _ = lockin_ratios(self.sp.targets + d, a, self.cal.hwhm, self.cal.mod)
-        z_lo, _ = lockin_ratios(self.sp.targets - d, a, self.cal.hwhm, self.cal.mod)
+        z_hi, _ = lockin_ratios(self.sp.targets + d, a, self.cal.hwhm, self.cal.mod, self.shape)
+        z_lo, _ = lockin_ratios(self.sp.targets - d, a, self.cal.hwhm, self.cal.mod, self.shape)
         self.z1_slope = (z_hi - z_lo) / (2 * d) / a
-        self.z1_target, _ = lockin_ratios(self.sp.targets, a, self.cal.hwhm, self.cal.mod)
+        self.z1_target, _ = lockin_ratios(self.sp.targets, a, self.cal.hwhm, self.cal.mod, self.shape)
         self.z1_target = self.z1_target / a
+
+    def _update_wave(self):
+        """Harmonic responses and the unit-fundamental wobble shape of each ring's own tone.
+
+        Sine: nothing to do (shape None). Sampled shapes: the actual one-period pattern of B1 is
+        expanded in harmonics b[k] (complex, b_1 real); each harmonic reaches the detuning through
+        the heater response at k*f. The online phase correction of the fundamental is carried to
+        harmonic k as k times (a delay error)."""
+        if not self.dither.square:
+            self.Hk, self.hk_ks, self.hk_b, self.shape = [self.H], (1,), [1.0], None
+            return
+        ks = K_HARM
+        self.hk_ks = ks
+        self.hk_b = list(self.dither.b)                  # (ks) x (tones)
+        own = np.arange(N)
+        Hk = []
+        for k, H0 in zip(ks, self._Hk0):
+            if k == 1:
+                Hk.append(self.H)
+            else:
+                H = H0.copy()
+                H[own, own] *= np.exp(1j * k * self.phcal)
+                Hk.append(H)
+        self.Hk = Hk
+        h1 = np.diag(self.H)
+        g = np.zeros((N, THETA.size))
+        a1 = np.abs(self.hk_b[0] * h1)
+        for k, b, H in zip(ks, self.hk_b, Hk):
+            c = b * np.diag(H) * np.exp(-1j * k * np.angle(self.hk_b[0] * h1)) / a1
+            g += np.real(c[:, None] * np.exp(1j * k * THETA[None, :]))
+        self.shape = g
 
     def _build_acq_tables(self):
         self.acq_tab = []
         for i in range(N):
             dgrid = np.linspace(-150, 60, 4201)
-            z1, _ = lockin_ratios(dgrid, self.cp.dither_max, self.cal.hwhm[i], self.cal.mod)
+            z1, _ = lockin_ratios(dgrid, self.cp.dither_max, self.cal.hwhm[i], self.cal.mod,
+                                  None if self.shape is None else self.shape[i])
             zmax = z1.max()
             self.acq_tab.append((dgrid, z1 / zmax))
             self.acq_peak = getattr(self, "acq_peak", []) + [zmax / self.cp.dither_max]
@@ -131,7 +183,7 @@ class TLC(SupervisorMixin):
         self.h_hist.clear()
         for _ in range(self.h_hist.maxlen):
             self.h_hist.append(self.model.h(u0))
-        self.dither.schedule(self.ukf.sigma, self.modes)
+        self.dither.schedule(self.ukf.sigma, self.modes, fixed=self.cp.dither_nominal if "no_sched" in self.ablate else None)
         self.dither.set_command_amplitude(self.h_own_abs, np.ones(N))
         self._d_blk = self.dither.cmd_amp.copy()
 
@@ -139,7 +191,7 @@ class TLC(SupervisorMixin):
         for i in rings:
             self.modes[i] = Mode.ACQUIRE
             self.acq[i] = dict(zmax=0.0, zf=0.0, n=0)
-        self.dither.schedule(self.ukf.sigma, self.modes)
+        self.dither.schedule(self.ukf.sigma, self.modes, fixed=self.cp.dither_nominal if "no_sched" in self.ablate else None)
         self.dither.set_command_amplitude(self.h_own_abs, np.ones(N))
         self._d_blk = self.dither.cmd_amp.copy()
 
@@ -158,7 +210,7 @@ class TLC(SupervisorMixin):
         y0, y1, y2, y1_all, valid = self.lockin.demod(self.H)
         # B10 online phase calibration of each own tone (slope sign known on the locked side)
         trk = (self.modes == Mode.TRACK) & valid
-        if trk.any():
+        if trk.any() and "no_phasecal" not in self.ablate:
             c = self.lockin.own_iq * np.sign(self.z1_target)
             self.iq_avg = np.where(trk, 0.98 * self.iq_avg + 0.02 * c / np.maximum(np.abs(c), 1e-9), self.iq_avg)
             ph = np.angle(self.iq_avg)
@@ -167,12 +219,16 @@ class TLC(SupervisorMixin):
                 d = np.where(use, ph - np.angle(np.diag(self.H)), 0.0)
                 self.H = self.H.copy()
                 self.H[np.arange(N), np.arange(N)] *= np.exp(1j * d)
+                self.phcal = self.phcal + d
+                self._update_wave()
         z1 = y1 / np.maximum(y0, 1e-6)
         z2 = y2 / np.maximum(y0, 1e-6)
         y0b = y.mean(0)                                   # fast DC level of this block
         # known detuning wobble in this block from every heater's tone (own + crosstalk), GHz
         ph_t = self.lockin.w[None, :] * (t_dec[:, None] - self.out_delay)          # (n, tones)
-        wob_blk = np.real(np.exp(1j * ph_t) @ (self.H * self._d_blk[None, :]).T)   # (n, rings)
+        wob_blk = np.zeros((n_dec, N))
+        for k, b, Hk in zip(() if "no_wobble" in self.ablate else self.hk_ks, self.hk_b, self.Hk):
+            wob_blk = wob_blk + np.real(np.exp(1j * k * ph_t) @ (Hk * (b * self._d_blk)[None, :]).T)   # (n, rings)
         a_win = np.mean(np.array(self.a_hist), axis=0) if len(self.a_hist) else self.dither.amp_ghz
         # measurement noise from B2's noise estimate (quality score)
         sig_f = self.cond.noise * self.cond.noise_gain
@@ -191,6 +247,8 @@ class TLC(SupervisorMixin):
 
         # squelch recognition from the PD alone: data-pattern noise disappears
         self._update_squelch()
+        if "no_squelch" in self.ablate:
+            self.squelch = np.zeros(N, bool)
 
         # ---- B4 predict with the thermal model (commands applied during this block) --
         h_prev = self.h_hist[-1] if len(self.h_hist) else self.model.h(self.out.u_prev)
@@ -204,9 +262,11 @@ class TLC(SupervisorMixin):
         hist = np.array(self.ukf.hist) if len(self.ukf.hist) else prior[None, :]
         lag_lock = prior - hist.mean(0)
         lag_dc = 0.5 * (prior - hist[-1])
+        if "no_lag" in self.ablate:
+            lag_lock, lag_dc = np.zeros(N), np.zeros(N)
         meas = dict(zeta=zeta, rz=rz, ok_lock=valid & tracking & lock_q,
-                    y0b=y0b, r0=r0, ok_dc=~invalid & tracking, a_nom=a_win,
-                    wob_blk=wob_blk, lag_lock=lag_lock, lag_dc=lag_dc, squelch=self.squelch)
+                    y0b=y0b, r0=r0, ok_dc=~invalid & tracking & ("no_dc" not in self.ablate), a_nom=a_win,
+                    wob_blk=wob_blk, lag_lock=lag_lock, lag_dc=lag_dc, squelch=self.squelch, shape=self.shape)
         p_before = self.ukf.x[2 * N:].copy()
         self.ukf.update(meas)
         # squelch changes the lineshape, not the optical power or PD gain: keep the DC scale fixed so
@@ -229,7 +289,7 @@ class TLC(SupervisorMixin):
         # ---- B10 learning ---------------------------------------------------------
         # heater efficiency at the tone: measured slope vs. the model's slope at the estimate
         zm1, _ = lockin_ratios(self.ukf.delta - lag_lock, a_win, self.cal.hwhm,
-                               np.where(self.squelch, 0.0, self.cal.mod))
+                               np.where(self.squelch, 0.0, self.cal.mod), self.shape)
         th_obs = np.where(np.abs(zm1) > 1e-6, z1 / np.where(np.abs(zm1) > 1e-6, zm1, 1.0), 1.0)
         ok_th = upd & lock_q & ~self.squelch & (self.ukf.sigma < 1.0) & (self.ukf.q_mult < 2.0)
         self.theta_obs = np.where(ok_th, 0.995 * self.theta_obs + 0.005 * th_obs, self.theta_obs)
@@ -259,7 +319,8 @@ class TLC(SupervisorMixin):
                 h_now = self.h_hist[-1]      # the MPC below must see the same model as its matrices
 
         # ---- B5 supervisor ---------------------------------------------------------
-        self._supervise(z1, y0b, valid, invalid)
+        if "no_sup" not in self.ablate:
+            self._supervise(z1, y0b, valid, invalid)
 
         # ---- B6 targets, B7 control -------------------------------------------------
         target = self.sp.targets
@@ -284,10 +345,10 @@ class TLC(SupervisorMixin):
         self._limit_flags(u_new, guard_hi)
 
         # ---- B1 dither schedule, B8 output ----------------------------------------------
-        self.dither.schedule(self.ukf.sigma, self.modes)
+        self.dither.schedule(self.ukf.sigma, self.modes, fixed=self.cp.dither_nominal if "no_sched" in self.ablate else None)
         self.dither.set_command_amplitude(self.h_own_abs, np.ones(N))
         self._d_blk = self.dither.cmd_amp.copy()
-        self.a_hist.append(self.dither.cmd_amp * self.h_own_abs)
+        self.a_hist.append(self.dither.cmd_amp * self.h_own_abs * self.dither.fund)
         self._d_blk = self.dither.cmd_amp.copy()
         seq, u_c, u_mean = self.out.produce(u_new, t_block_start + ts, self.dither, guard_hi)
         self._u_mean_last = u_mean

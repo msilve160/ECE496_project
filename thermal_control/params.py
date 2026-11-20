@@ -38,6 +38,16 @@ class PlantParams:
     tau_shs: float = 7.7e-6
     abs_frac: float = 0.30             # fraction of laser power absorbed at the resonance peak (assumed)
 
+    # --- extended thermal / electrical effects (all off by default; PlantParams.advanced() turns them on)
+    r_hm: float = 0.0                  # K/W extra medium heater path (membrane / oxide spreading)
+    tau_hm: float = 400e-6             # s
+    r_hd: float = 0.0                  # K/W extra slow heater path (die / package spreading)
+    tau_hd: float = 4e-3               # s
+    heater_curve: float = 0.0          # beta in P = Pmax (u + beta u (1-u)): heater power not linear in the command
+    kappa_tc: float = 0.0              # 1/K, relative rise of the thermo-optic coefficient with ring temperature
+    rin_dbc_hz: float = -200.0         # laser relative intensity noise, dBc/Hz (white)
+    adc_inl_lsb: float = 0.0           # peak static ADC integral nonlinearity, LSB
+
     # --- modulator electrical self heating (ref [4] Table 1c) ----------------------
     r_e: float = 2905.0
     tau_e: float = 0.2e-6
@@ -56,7 +66,43 @@ class PlantParams:
     pd_rate: float = 1e6               # S/s, proposal R26
     pd_bits: int = 12                  # proposal R26
     pd_full_scale_mw: float = 1.35     # drop-port optical power giving ADC full scale (assumed)
-    pd_noise_fs: float = 4e-4          # rms TIA/ADC input noise per sample, fraction of full scale (assumed)
+    # Noise sources of the monitor chain (all assumed). The three physical ones are computed from
+    # the photocurrent: the tap puts pd_fs_current_ua on the TIA at ADC full scale.
+    pd_fs_current_ua: float = 5.0      # photocurrent at ADC full scale (~0.4 % tap of the drop port)
+    pd_rf_kohm: float = 100.0          # TIA feedback resistor: Johnson-Nyquist current noise 4kT/Rf
+    pd_temp_k: float = 300.0           # K
+    pd_noise_fs: float = 3.8e-4        # rms amplifier + ADC excess noise per sample, fraction of FS
+    pd_noise_scale: float = 1.0        # multiplies all three random noise sources (sensitivity sweeps)
+    pd_shot: bool = True               # signal-dependent shot noise sqrt(2 q I B)
+    pd_johnson: bool = True            # Johnson-Nyquist noise of the TIA feedback resistor
+    pd_offset_fs: tuple = (0.003, -0.002, 0.004, -0.003)   # static DC offset per ring, fraction of FS
+    pd_offset_drift_fs_per_s: tuple = (0.0, 0.0, 0.0, 0.0)  # slow linear offset drift
+
+    @classmethod
+    def advanced(cls, **kw):
+        """Plant with the extended effects on: two extra heater poles (about +13 % DC gain the
+        controller's two-pole model does not have), a 12 % bow in heater power vs command, a 0.1 %/K
+        rise of the thermo-optic coefficient, laser RIN of -130 dBc/Hz, and 1.5 LSB of ADC INL."""
+        d = dict(r_hm=150.0, r_hd=60.0, heater_curve=0.12, kappa_tc=1e-3, rin_dbc_hz=-130.0, adc_inl_lsb=1.5)
+        d.update(kw)
+        return cls(**d)
+
+    def noise_sigma_fs(self, level=None):
+        """rms noise per sample (fraction of FS) at signal `level` (fraction of FS; array ok)."""
+        q, kb = 1.602e-19, 1.381e-23
+        bw = self.pd_rate / 2                       # noise bandwidth: Nyquist of the 1 MS/s sampling
+        i_fs = self.pd_fs_current_ua * 1e-6
+        var = np.full_like(np.asarray(0.0 if level is None else level, float), self.pd_noise_fs ** 2)
+        if self.pd_johnson:
+            var = var + (4 * kb * self.pd_temp_k * bw / (self.pd_rf_kohm * 1e3)) / i_fs ** 2
+        if self.pd_shot and level is not None:
+            var = var + 2 * q * bw * np.maximum(level, 0.0) / i_fs
+        return self.pd_noise_scale * np.sqrt(var)
+
+    def noise_floor_fs(self):
+        """Noise rms at a typical operating level with no data-pattern noise: what the controller
+        calibrates as its squelch floor."""
+        return float(self.noise_sigma_fs(0.4))
 
     # --- unheated resonance positions (relative to each ring's own laser) ------------
     # Default: ~250 GHz short of the operating point so heaters sit mid-range and the D1-D3
@@ -81,6 +127,11 @@ class ControllerParams:
     # 10 kHz control-update ripple and >= 8 bins from DC (Hann window in B3). Kept low because the
     # R19 slew limit (10 % FS/ms) caps dither amplitude x frequency.
     tone_freqs: tuple = (2.0e3, 3.0e3, 3.5e3, 4.5e3)
+    # Dither waveform: "sine" or "square" (an FPGA toggles a square wave trivially). A square wave puts
+    # energy in odd harmonics, so its tones are re-chosen (SQUARE_TONES) to keep every harmonic up to
+    # the 9th, the 2nd-order intermodulation products and the 10 kHz ripple >= 500 Hz from every
+    # demodulated line. Amplitudes are set so the *fundamental* detuning amplitude equals the sine's.
+    dither_shape: str = "sine"        # "sine", "square", "three" (3-level), "triangle" or "qsine" (5-level sine)
     dither_min: float = 0.1            # GHz peak detuning (proposal B1)
     dither_max: float = 0.5
     dither_nominal: float = 0.3
@@ -129,6 +180,16 @@ class ControllerParams:
     rls_lambda: float = 0.9995
     eff_bounds: tuple = (0.7, 1.3)
     coupling_bounds: tuple = (0.6, 1.5)
+
+    def __post_init__(self):
+        if self.dither_shape != "sine" and tuple(self.tone_freqs) == (2.0e3, 3.0e3, 3.5e3, 4.5e3):
+            self.tone_freqs = SQUARE_TONES
+
+
+# f = out_rate / N with N even (26, 22, 16, 14 samples per period): every half period is a whole number of
+# 10 us output samples, so the toggled square wave has no duty-cycle error (and hence no 2nd harmonic).
+# The only such set with >= 500 Hz between every demodulated line and every other line.
+SQUARE_TONES = tuple(100e3 / n for n in (26, 22, 16, 14))
 
 
 def coupling_matrix(coupling, n=N_RINGS):
