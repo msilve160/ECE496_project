@@ -26,7 +26,7 @@ class SupervisorMixin:
     def _update_squelch(self):
         # expected data-pattern noise at lock is well above the TIA noise floor. Hysteresis: on after
         # 2 quiet blocks below 1.25x the floor, off only after 2 blocks above 2x the floor
-        floor = self.pp.pd_noise_fs
+        floor = self.pp.noise_floor_fs()
         quiet = self.cond.noise_inst < 1.25 * floor
         loud = self.cond.noise_inst > 2.0 * floor
         self.sq_count = np.where(quiet, self.sq_count + 1, 0)

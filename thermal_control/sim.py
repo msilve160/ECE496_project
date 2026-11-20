@@ -1,5 +1,6 @@
 """Closed-loop co-simulation of the plant with a controller (TLC or baseline)."""
 import time
+from dataclasses import replace
 import numpy as np
 
 from disturbances import Disturbances
@@ -23,7 +24,7 @@ def lock_operating_point(plant: Plant, targets, dist0, iters=60):
 
 
 def run(kind="tlc", T=0.2, dist=None, pp=None, cp=None, seed=0, start="locked",
-        events=None, mpc=True, learn=True, verbose=False, plant_pp=None):
+        events=None, mpc=True, learn=True, verbose=False, plant_pp=None, ablate=()):
     """Simulate for T seconds.
 
     kind: 'tlc' or 'baseline'. start: 'locked' (warm start at the operating point) or
@@ -33,11 +34,16 @@ def run(kind="tlc", T=0.2, dist=None, pp=None, cp=None, seed=0, start="locked",
     """
     pp = pp or PlantParams()
     cp = cp or ControllerParams()
+    ablate = frozenset(ablate)
+    if "no_gate" in ablate:
+        cp = replace(cp, ukf_gate=1e9)
+    if "no_qadapt" in ablate:
+        cp = replace(cp, ukf_q_adapt=1.0)
     plant_pp = plant_pp or pp
     dist = dist or Disturbances()
     rng = np.random.default_rng(seed)
     plant = Plant(plant_pp, rng)
-    ctl = TLC(pp, cp, use_mpc=mpc, learn=learn) if kind == "tlc" else BaselinePI(pp, cp)
+    ctl = TLC(pp, cp, use_mpc=mpc and "no_mpc" not in ablate, learn=learn and "no_learn" not in ablate, ablate=ablate) if kind == "tlc" else BaselinePI(pp, cp)
     targets = ctl.sp.targets
     d0 = dist.evaluate(np.array([0.0]))
     if start == "locked":

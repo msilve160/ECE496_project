@@ -22,9 +22,10 @@ _NQ = 24
 _THETA = 2 * np.pi * (np.arange(_NQ) + 0.5) / _NQ
 _COS1 = np.cos(_THETA)
 _COS2 = np.cos(2 * _THETA)
+THETA = _THETA
 
 
-def lockin_ratios(delta, a, hwhm, mod_shift):
+def lockin_ratios(delta, a, hwhm, mod_shift, shape=None):
     """Ideal lock-in outputs normalised by the DC level.
 
     For a detuning wobble delta + a*cos(theta), returns
@@ -32,8 +33,11 @@ def lockin_ratios(delta, a, hwhm, mod_shift):
       z2 = y2 / y0  (second harmonic, ~ a^2 T''/(4T): curvature)
     exactly (by quadrature over theta), with y_k = 2 <L cos(k theta)>, y0 = <L>.
     Broadcasts over delta / a / hwhm. Dividing by y0 removes laser power and PD gain.
+    `shape` (..., 24) replaces the sinusoidal wobble by a * shape(theta); it must have unit fundamental
+    amplitude (2 <shape cos theta> = 1) so `a` stays the fundamental amplitude. Used for square dithers.
     """
-    d = np.asarray(delta)[..., None] + np.asarray(a)[..., None] * _COS1
+    wob = _COS1 if shape is None else np.asarray(shape)
+    d = np.asarray(delta)[..., None] + np.asarray(a)[..., None] * wob
     h = np.asarray(hwhm)[..., None]
     m = np.asarray(mod_shift, float)
     lv = drop_avg(d, h, m[..., None] if m.ndim else m)
